@@ -177,6 +177,17 @@ function printCatalog(songs: CatalogSong[]) {
 
 // ---------- helpers ----------
 
+// whose({name}) est cassé pour les noms contenant des emoji, et les getters bulk
+// (tracks.persistentID(), etc.) lèvent -1728 sur une playlist vide — d'où ces helpers.
+const PLAYLIST_HELPERS = `
+  const playlistByName = (name) => {
+    const i = Music.playlists.name().indexOf(name);
+    if (i === -1) throw "Playlist introuvable : " + name;
+    return Music.playlists[i];
+  };
+  const safeTracks = (pl) => { try { return pl.tracks(); } catch { return []; } };
+`;
+
 const TRACK_PROPS = `
   const trackInfo = (t) => ({
     name: t.name(),
@@ -300,10 +311,8 @@ const commands: Record<string, { desc: string; usage?: string; run: (args: strin
       const name = args.join(" ");
       if (!name) die("Usage : am playlist <nom>");
       const tracks = jxa<Track[]>(`
-        ${TRACK_PROPS}
-        const pl = Music.playlists.whose({ name: arg })[0];
-        if (!pl.exists()) throw "Playlist introuvable : " + arg;
-        return pl.tracks().map(trackInfo);
+        ${TRACK_PROPS}${PLAYLIST_HELPERS}
+        return safeTracks(playlistByName(arg)).map(trackInfo);
       `, name);
       printTracks(tracks);
     },
@@ -319,12 +328,11 @@ const commands: Record<string, { desc: string; usage?: string; run: (args: strin
       const playlist = args.slice(toIdx + 1).join(" ");
       if (!query) die("Usage : am add <termes> --to <playlist>");
       const added = jxa<Track>(`
-        ${TRACK_PROPS}
+        ${TRACK_PROPS}${PLAYLIST_HELPERS}
         const lib = Music.libraryPlaylists[0];
         const results = Music.search(lib, { for: arg.query });
         if (results.length === 0) throw "Aucun morceau trouvé pour : " + arg.query;
-        const pl = Music.playlists.whose({ name: arg.playlist })[0];
-        if (!pl.exists()) throw "Playlist introuvable : " + arg.playlist;
+        const pl = playlistByName(arg.playlist);
         const track = results[0];
         Music.duplicate(track, { to: pl });
         return trackInfo(track);
@@ -340,8 +348,7 @@ const commands: Record<string, { desc: string; usage?: string; run: (args: strin
       const name = args.join(" ");
       if (!name) die("Usage : am new-playlist <nom>");
       jxa(`
-        const pl = Music.Playlist({ name: arg });
-        Music.playlists.push(pl);
+        Music.make({ new: "playlist", withProperties: { name: arg } });
       `, name);
       console.log(`${green("✓")} Playlist ${bold(name)} créée`);
     },
@@ -566,10 +573,9 @@ const commands: Record<string, { desc: string; usage?: string; run: (args: strin
       const playlist = args.slice(fromIdx + 1).join(" ");
       if (!query) die("Usage : am remove <termes> --from <playlist>");
       const removed = jxa<Track>(`
-        ${TRACK_PROPS}
-        const pl = Music.playlists.whose({ name: arg.playlist })[0];
-        if (!pl.exists()) throw "Playlist introuvable : " + arg.playlist;
-        const tracks = pl.tracks();
+        ${TRACK_PROPS}${PLAYLIST_HELPERS}
+        const pl = playlistByName(arg.playlist);
+        const tracks = safeTracks(pl);
         const match = tracks.find(t =>
           (t.name() + " " + t.artist()).toLowerCase().includes(arg.query));
         if (!match) throw "Aucun morceau de la playlist ne correspond à : " + arg.query;
