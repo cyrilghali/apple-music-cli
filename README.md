@@ -34,6 +34,26 @@ ln -sf "$PWD/am" ~/.local/bin/am
 | `am love` / `am unlove` | Favori sur le morceau en cours |
 | `am rate <0-5>` | Noter le morceau en cours |
 
+### Cloud (catalogue Apple Music)
+
+| Commande | Effet |
+|---|---|
+| `am catalog <termes> [--limit N]` | Chercher dans le catalogue Apple Music |
+| `am cloud-add <termes \| #id>` | Ajouter un morceau du catalogue à la bibliothèque cloud |
+| `am delete <termes>` | Supprimer un morceau de la bibliothèque (propagé au cloud si « Synchroniser la bibliothèque » est activé) |
+| `am remove <termes> --from <playlist>` | Retirer un morceau d'une playlist |
+| `am login [token]` | Enregistrer le Media User Token / afficher l'état |
+
+La lecture du catalogue (`catalog`) fonctionne sans compte : le token développeur anonyme
+de music.apple.com est récupéré et mis en cache automatiquement (`~/.config/am/config.json`).
+
+Les **écritures cloud** (`cloud-add`) demandent ton *Media User Token* :
+
+1. Ouvre <https://music.apple.com> et connecte-toi
+2. Outils de développement (⌥⌘I) → Application/Stockage → Cookies → music.apple.com
+3. Copie la valeur du cookie `media-user-token`
+4. `am login '<token>'`
+
 ### Playlists
 
 | Commande | Effet |
@@ -54,5 +74,7 @@ am recent
 
 ## Limites connues
 
-- `search`/`add` opèrent sur la **bibliothèque locale** uniquement — le scripting de Music.app n'expose pas la recherche dans le catalogue Apple Music.
-- `add` prend le **premier** résultat de recherche ; affine les termes si besoin.
+- `search`/`add` opèrent sur la bibliothèque **locale** (= la bibliothèque cloud si « Synchroniser la bibliothèque » est activé) ; `catalog`/`cloud-add` passent par l'API Apple Music.
+- `add` et `cloud-add` prennent le **premier** résultat de recherche ; affine les termes ou passe un `#id` de `am catalog`.
+- L'API Apple Music publique ne permet pas de **supprimer** un morceau de la bibliothèque cloud — `am delete` passe par Music.app, dont la suppression se synchronise au cloud.
+- Le `media-user-token` expire au bout de quelques mois ; refais `am login` si les écritures renvoient 403.

@@ -46,6 +46,135 @@ function die(msg: string): never {
   process.exit(1);
 }
 
+// ---------- Apple Music API (cloud) ----------
+
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+const CONFIG_DIR = join(homedir(), ".config", "am");
+const CONFIG_PATH = join(CONFIG_DIR, "config.json");
+
+interface Config {
+  devToken?: string;
+  mediaUserToken?: string;
+  storefront?: string;
+}
+
+function loadConfig(): Config {
+  try { return JSON.parse(readFileSync(CONFIG_PATH, "utf8")); } catch { return {}; }
+}
+
+function saveConfig(cfg: Config) {
+  mkdirSync(CONFIG_DIR, { recursive: true });
+  writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+}
+
+const BROWSER_UA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
+
+/** Récupère le token développeur anonyme depuis le bundle JS public de music.apple.com. */
+async function scrapeDevToken(): Promise<string> {
+  const html = await (
+    await fetch("https://music.apple.com/fr/browse", { headers: { "User-Agent": BROWSER_UA } })
+  ).text();
+  const jsPaths = [...html.matchAll(/\/assets\/index[A-Za-z0-9~._-]*\.js/g)].map((m) => m[0]);
+  if (jsPaths.length === 0) die("Impossible de trouver le bundle JS de music.apple.com (structure changée ?)");
+  // JWT ES256 signé "WebPlayKid" : trois segments base64url, header commençant par eyJ
+  const jwtRe = /eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{20,}/;
+  for (const path of [...new Set(jsPaths)]) {
+    const js = await (
+      await fetch(`https://music.apple.com${path}`, { headers: { "User-Agent": BROWSER_UA } })
+    ).text();
+    const m = js.match(jwtRe);
+    if (m) return m[0];
+  }
+  die("Token développeur introuvable dans les bundles de music.apple.com.");
+}
+
+function tokenExpired(jwt: string): boolean {
+  try {
+    const payload = JSON.parse(Buffer.from(jwt.split(".")[1], "base64").toString());
+    return payload.exp * 1000 < Date.now() + 60_000;
+  } catch { return true; }
+}
+
+async function getDevToken(): Promise<string> {
+  const cfg = loadConfig();
+  if (cfg.devToken && !tokenExpired(cfg.devToken)) return cfg.devToken;
+  const token = await scrapeDevToken();
+  saveConfig({ ...loadConfig(), devToken: token });
+  return token;
+}
+
+async function api(
+  path: string,
+  opts: { method?: string; userToken?: boolean; body?: unknown } = {}
+): Promise<any> {
+  const cfg = loadConfig();
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${await getDevToken()}`,
+    Origin: "https://music.apple.com",
+  };
+  if (opts.userToken) {
+    if (!cfg.mediaUserToken) {
+      die(
+        "Cette commande modifie ta bibliothèque cloud et nécessite ton Media User Token.\n" +
+        "  1. Ouvre https://music.apple.com et connecte-toi\n" +
+        "  2. Outils de développement (⌥⌘I) → onglet Application/Stockage → Cookies → music.apple.com\n" +
+        "  3. Copie la valeur du cookie \x1b[1mmedia-user-token\x1b[0m\n" +
+        "  4. Lance : am login <token>"
+      );
+    }
+    headers["Media-User-Token"] = cfg.mediaUserToken;
+  }
+  const res = await fetch(`https://api.music.apple.com${path}`, {
+    method: opts.method ?? "GET",
+    headers,
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  if (res.status === 401 || res.status === 403) {
+    die(`API Apple Music : accès refusé (${res.status}).${opts.userToken ? " Ton media-user-token a peut-être expiré — refais `am login <token>`." : ""}`);
+  }
+  if (!res.ok) die(`API Apple Music : ${res.status} ${await res.text()}`);
+  return res.status === 202 || res.status === 204 ? null : res.json();
+}
+
+async function getStorefront(): Promise<string> {
+  const cfg = loadConfig();
+  if (cfg.storefront) return cfg.storefront;
+  let sf = "fr";
+  if (cfg.mediaUserToken) {
+    try { sf = (await api("/v1/me/storefront", { userToken: true })).data[0].id; } catch {}
+  }
+  saveConfig({ ...loadConfig(), storefront: sf });
+  return sf;
+}
+
+interface CatalogSong {
+  id: string;
+  attributes: { name: string; artistName: string; albumName: string; durationInMillis: number };
+}
+
+async function catalogSearch(query: string, limit: number): Promise<CatalogSong[]> {
+  const sf = await getStorefront();
+  const res = await api(
+    `/v1/catalog/${sf}/search?term=${encodeURIComponent(query)}&types=songs&limit=${Math.min(limit, 25)}`
+  );
+  return res.results?.songs?.data ?? [];
+}
+
+function printCatalog(songs: CatalogSong[]) {
+  if (songs.length === 0) { console.log(dim("(aucun résultat)")); return; }
+  const w = Math.min(50, Math.max(...songs.map((s) => s.attributes.name.length)));
+  for (const s of songs) {
+    const a = s.attributes;
+    console.log(
+      `  ${bold(a.name.slice(0, 50).padEnd(w))}  ${a.artistName.slice(0, 30).padEnd(30)} ${dim(a.albumName.slice(0, 30).padEnd(30))} ${dim(fmtDur(a.durationInMillis / 1000))} ${dim(`#${s.id}`)}`
+    );
+  }
+}
+
 // ---------- helpers ----------
 
 const TRACK_PROPS = `
@@ -98,7 +227,7 @@ function printTracks(tracks: Track[]) {
 
 // ---------- commands ----------
 
-const commands: Record<string, { desc: string; usage?: string; run: (args: string[]) => void }> = {
+const commands: Record<string, { desc: string; usage?: string; run: (args: string[]) => void | Promise<void> }> = {
   now: {
     desc: "Morceau en cours de lecture",
     run: () => {
@@ -338,6 +467,120 @@ const commands: Record<string, { desc: string; usage?: string; run: (args: strin
     },
   },
 
+  catalog: {
+    desc: "Chercher dans le catalogue Apple Music (cloud)",
+    usage: "am catalog <termes> [--limit N]",
+    run: async (args) => {
+      const { query, limit } = parseQuery(args);
+      if (!query) die("Usage : am catalog <termes>");
+      printCatalog(await catalogSearch(query, limit));
+    },
+  },
+
+  "cloud-add": {
+    desc: "Ajouter un morceau du catalogue à ta bibliothèque cloud",
+    usage: "am cloud-add <termes | #id>",
+    run: async (args) => {
+      const query = args.join(" ");
+      if (!query) die("Usage : am cloud-add <termes | #id>");
+      let song: { id: string; label: string };
+      if (/^#?\d+$/.test(query)) {
+        song = { id: query.replace("#", ""), label: `#${query.replace("#", "")}` };
+      } else {
+        const results = await catalogSearch(query, 5);
+        if (results.length === 0) die(`Aucun résultat catalogue pour : ${query}`);
+        const s = results[0];
+        song = { id: s.id, label: `${bold(s.attributes.name)} — ${s.attributes.artistName}` };
+      }
+      await api(`/v1/me/library?ids[songs]=${song.id}`, { method: "POST", userToken: true });
+      console.log(`${green("✓")} ${song.label} ajouté à ta bibliothèque cloud`);
+      console.log(dim("  (la synchro dans Music.app peut prendre quelques secondes)"));
+    },
+  },
+
+  login: {
+    desc: "Enregistrer ton Media User Token (écritures cloud)",
+    usage: "am login <media-user-token>",
+    run: async (args) => {
+      const token = args[0];
+      if (!token) {
+        const cfg = loadConfig();
+        console.log(`Token dev      : ${cfg.devToken ? green("ok (auto)") : dim("absent (récupéré automatiquement)")}`);
+        console.log(`Media User Token : ${cfg.mediaUserToken ? green("enregistré") : red("absent")}`);
+        if (!cfg.mediaUserToken) {
+          console.log(
+            "\nPour l'obtenir :\n" +
+            "  1. Ouvre https://music.apple.com et connecte-toi\n" +
+            "  2. Outils de développement (⌥⌘I) → Application/Stockage → Cookies → music.apple.com\n" +
+            `  3. Copie la valeur du cookie ${bold("media-user-token")}\n` +
+            "  4. Lance : am login '<token>'"
+          );
+        }
+        return;
+      }
+      saveConfig({ ...loadConfig(), mediaUserToken: token, storefront: undefined });
+      const sf = await getStorefront();
+      console.log(`${green("✓")} Token enregistré (storefront : ${bold(sf)})`);
+    },
+  },
+
+  delete: {
+    desc: "Supprimer un morceau de la bibliothèque (synchronisé au cloud)",
+    usage: "am delete <termes>",
+    run: (args) => {
+      const query = args.join(" ");
+      if (!query) die("Usage : am delete <termes>");
+      const matches = jxa<Track[]>(`
+        ${TRACK_PROPS}
+        const lib = Music.libraryPlaylists[0];
+        return Music.search(lib, { for: arg }).slice(0, 10).map(trackInfo);
+      `, query);
+      if (matches.length === 0) die(`Aucun morceau trouvé pour : ${query}`);
+      if (matches.length > 1) {
+        console.log(`${matches.length} morceaux correspondent — précise ta recherche :`);
+        printTracks(matches);
+        return;
+      }
+      const t = matches[0];
+      const deleted = jxa<Track>(`
+        ${TRACK_PROPS}
+        const lib = Music.libraryPlaylists[0];
+        const track = lib.tracks.whose({ persistentID: arg })[0];
+        if (!track.exists()) throw "Morceau introuvable (id " + arg + ")";
+        const info = trackInfo(track);
+        Music.delete(track);
+        return info;
+      `, t.id);
+      console.log(`${red("✗")} ${bold(deleted.name)} — ${deleted.artist} supprimé de la bibliothèque`);
+      console.log(dim("  (avec « Synchroniser la bibliothèque » activé, la suppression se propage au cloud)"));
+    },
+  },
+
+  remove: {
+    desc: "Retirer un morceau d'une playlist (sans le supprimer de la bibliothèque)",
+    usage: "am remove <termes> --from <playlist>",
+    run: (args) => {
+      const fromIdx = args.indexOf("--from");
+      if (fromIdx === -1 || fromIdx === args.length - 1) die("Usage : am remove <termes> --from <playlist>");
+      const query = args.slice(0, fromIdx).join(" ").toLowerCase();
+      const playlist = args.slice(fromIdx + 1).join(" ");
+      if (!query) die("Usage : am remove <termes> --from <playlist>");
+      const removed = jxa<Track>(`
+        ${TRACK_PROPS}
+        const pl = Music.playlists.whose({ name: arg.playlist })[0];
+        if (!pl.exists()) throw "Playlist introuvable : " + arg.playlist;
+        const tracks = pl.tracks();
+        const match = tracks.find(t =>
+          (t.name() + " " + t.artist()).toLowerCase().includes(arg.query));
+        if (!match) throw "Aucun morceau de la playlist ne correspond à : " + arg.query;
+        const info = trackInfo(match);
+        Music.delete(match);
+        return info;
+      `, { query, playlist });
+      console.log(`${green("✓")} ${bold(removed.name)} — ${removed.artist} retiré de ${bold(playlist)}`);
+    },
+  },
+
   help: {
     desc: "Afficher cette aide",
     run: () => {
@@ -368,4 +611,4 @@ if (!command) {
   commands.help.run([]);
   process.exit(1);
 }
-command.run(rest);
+await command.run(rest);
