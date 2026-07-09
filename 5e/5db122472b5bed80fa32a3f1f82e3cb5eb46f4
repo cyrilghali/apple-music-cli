@@ -1,0 +1,23 @@
+am
+  s_e84ab69d52d2f9::t_65b003d9a5ace0 314-315
+  s_e84ab69d52d2f9::t_6c99069aa164c8 576-578
+  s_e84ab69d52d2f9::t_83a8c27de05c62 351
+  s_e84ab69d52d2f9::t_c735fbadae2722 331,335
+  s_e84ab69d52d2f9::t_9e71c2fdb9dfed 180-190
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5e5db122472b5bed80fa32a3f1f82e3cb5eb46f4",
+  "prompts": {},
+  "sessions": {
+    "s_e84ab69d52d2f9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ef1248ae-9f4d-4b8a-98f1-f30d9a7debc0",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Cyril GHALI <cyril.ghali@tryriot.com>"
+    }
+  }
+}
