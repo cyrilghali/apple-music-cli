@@ -1,0 +1,371 @@
+#!/usr/bin/env bun
+/**
+ * am — Apple Music CLI
+ * Pilote Music.app via JXA (osascript), zéro dépendance.
+ */
+
+import { spawnSync } from "node:child_process";
+
+// ---------- JXA bridge ----------
+
+function jxa<T>(fnBody: string, arg: unknown = null): T {
+  const script = `
+    ObjC.import('stdlib');
+    function run(argv) {
+      const Music = Application("Music");
+      const arg = JSON.parse(argv[0] || "null");
+      const fn = (Music, arg) => { ${fnBody} };
+      try {
+        return JSON.stringify({ ok: true, data: fn(Music, arg) });
+      } catch (e) {
+        return JSON.stringify({ ok: false, error: String(e) });
+      }
+    }
+  `;
+  const res = spawnSync("osascript", ["-l", "JavaScript", "-e", script, JSON.stringify(arg)], {
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  if (res.status !== 0) {
+    const err = (res.stderr || "").trim();
+    if (err.includes("-1743") || err.toLowerCase().includes("not authorized")) {
+      die(
+        "Accès refusé à Music.app.\n" +
+        "Autorise ton terminal dans : Réglages Système → Confidentialité et sécurité → Automatisation → ton terminal → Musique."
+      );
+    }
+    die(`osascript a échoué : ${err}`);
+  }
+  const parsed = JSON.parse(res.stdout.trim());
+  if (!parsed.ok) die(`Erreur Music.app : ${parsed.error}`);
+  return parsed.data as T;
+}
+
+function die(msg: string): never {
+  console.error(`\x1b[31m✗\x1b[0m ${msg}`);
+  process.exit(1);
+}
+
+// ---------- helpers ----------
+
+const TRACK_PROPS = `
+  const trackInfo = (t) => ({
+    name: t.name(),
+    artist: t.artist(),
+    album: t.album(),
+    duration: t.duration(),
+    loved: (() => { try { return t.favorited(); } catch { try { return t.loved(); } catch { return false; } } })(),
+    rating: t.rating(),
+    playedCount: t.playedCount(),
+    id: t.persistentID(),
+  });
+`;
+
+interface Track {
+  name: string;
+  artist: string;
+  album: string;
+  duration: number;
+  loved: boolean;
+  rating: number;
+  playedCount: number;
+  id: string;
+}
+
+const fmtDur = (s: number) => {
+  const m = Math.floor(s / 60);
+  return `${m}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+};
+
+const bold = (s: string) => `\x1b[1m${s}\x1b[0m`;
+const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
+const green = (s: string) => `\x1b[32m${s}\x1b[0m`;
+const red = (s: string) => `\x1b[31m${s}\x1b[0m`;
+const heart = (t: Track) => (t.loved ? red(" ♥") : "");
+
+function printTracks(tracks: Track[]) {
+  if (tracks.length === 0) {
+    console.log(dim("(aucun morceau)"));
+    return;
+  }
+  const w = Math.min(50, Math.max(...tracks.map((t) => t.name.length)));
+  for (const t of tracks) {
+    console.log(
+      `  ${bold(t.name.slice(0, 50).padEnd(w))}  ${t.artist.slice(0, 30).padEnd(30)} ${dim(t.album.slice(0, 30).padEnd(30))} ${dim(fmtDur(t.duration))}${heart(t)}`
+    );
+  }
+}
+
+// ---------- commands ----------
+
+const commands: Record<string, { desc: string; usage?: string; run: (args: string[]) => void }> = {
+  now: {
+    desc: "Morceau en cours de lecture",
+    run: () => {
+      const info = jxa<{ state: string; track: Track | null; position: number } | null>(`
+        ${TRACK_PROPS}
+        if (!Music.running()) return null;
+        const state = Music.playerState();
+        let track = null;
+        try { track = trackInfo(Music.currentTrack()); } catch {}
+        return { state, track, position: track ? Music.playerPosition() : 0 };
+      `);
+      if (!info || !info.track) {
+        console.log(dim("Rien en lecture."));
+        return;
+      }
+      const icon = info.state === "playing" ? green("▶") : "⏸";
+      const t = info.track;
+      console.log(`${icon} ${bold(t.name)}${heart(t)}`);
+      console.log(`  ${t.artist} — ${dim(t.album)}`);
+      console.log(`  ${dim(`${fmtDur(info.position)} / ${fmtDur(t.duration)}`)}`);
+    },
+  },
+
+  play: { desc: "Lancer la lecture", run: () => { jxa(`Music.play()`); console.log(green("▶ lecture")); } },
+  pause: { desc: "Mettre en pause", run: () => { jxa(`Music.pause()`); console.log("⏸ pause"); } },
+  toggle: { desc: "Play/pause", run: () => { jxa(`Music.playpause()`); commands.now.run([]); } },
+  next: { desc: "Morceau suivant", run: () => { jxa(`Music.nextTrack()`); commands.now.run([]); } },
+  prev: { desc: "Morceau précédent", run: () => { jxa(`Music.previousTrack()`); commands.now.run([]); } },
+
+  search: {
+    desc: "Chercher dans la bibliothèque",
+    usage: "am search <termes> [--limit N]",
+    run: (args) => {
+      const { query, limit } = parseQuery(args);
+      if (!query) die("Usage : am search <termes>");
+      const tracks = jxa<Track[]>(`
+        ${TRACK_PROPS}
+        const lib = Music.libraryPlaylists[0];
+        const results = Music.search(lib, { for: arg.query });
+        return results.slice(0, arg.limit).map(trackInfo);
+      `, { query, limit });
+      printTracks(tracks);
+    },
+  },
+
+  playlists: {
+    desc: "Lister les playlists",
+    run: () => {
+      const lists = jxa<{ name: string; count: number; special: string }[]>(`
+        return Music.playlists().map(p => ({
+          name: p.name(),
+          count: p.tracks.length,
+          special: (() => { try { return p.specialKind(); } catch { return "none"; } })(),
+        })).filter(p => !["Library", "Music"].includes(p.name));
+      `);
+      const user = lists.filter((l) => l.special === "none");
+      const smart = lists.filter((l) => l.special !== "none");
+      for (const l of user) console.log(`  ${bold(l.name)} ${dim(`(${l.count})`)}`);
+      if (smart.length) {
+        console.log(dim("  — système —"));
+        for (const l of smart) console.log(`  ${dim(l.name)} ${dim(`(${l.count})`)}`);
+      }
+    },
+  },
+
+  playlist: {
+    desc: "Afficher les morceaux d'une playlist",
+    usage: "am playlist <nom>",
+    run: (args) => {
+      const name = args.join(" ");
+      if (!name) die("Usage : am playlist <nom>");
+      const tracks = jxa<Track[]>(`
+        ${TRACK_PROPS}
+        const pl = Music.playlists.whose({ name: arg })[0];
+        if (!pl.exists()) throw "Playlist introuvable : " + arg;
+        return pl.tracks().map(trackInfo);
+      `, name);
+      printTracks(tracks);
+    },
+  },
+
+  add: {
+    desc: "Ajouter un morceau de la bibliothèque à une playlist",
+    usage: "am add <termes> --to <playlist>",
+    run: (args) => {
+      const toIdx = args.indexOf("--to");
+      if (toIdx === -1 || toIdx === args.length - 1) die("Usage : am add <termes> --to <playlist>");
+      const query = args.slice(0, toIdx).join(" ");
+      const playlist = args.slice(toIdx + 1).join(" ");
+      if (!query) die("Usage : am add <termes> --to <playlist>");
+      const added = jxa<Track>(`
+        ${TRACK_PROPS}
+        const lib = Music.libraryPlaylists[0];
+        const results = Music.search(lib, { for: arg.query });
+        if (results.length === 0) throw "Aucun morceau trouvé pour : " + arg.query;
+        const pl = Music.playlists.whose({ name: arg.playlist })[0];
+        if (!pl.exists()) throw "Playlist introuvable : " + arg.playlist;
+        const track = results[0];
+        Music.duplicate(track, { to: pl });
+        return trackInfo(track);
+      `, { query, playlist });
+      console.log(`${green("✓")} ${bold(added.name)} — ${added.artist} ajouté à ${bold(playlist)}`);
+    },
+  },
+
+  "new-playlist": {
+    desc: "Créer une playlist",
+    usage: "am new-playlist <nom>",
+    run: (args) => {
+      const name = args.join(" ");
+      if (!name) die("Usage : am new-playlist <nom>");
+      jxa(`
+        const pl = Music.Playlist({ name: arg });
+        Music.playlists.push(pl);
+      `, name);
+      console.log(`${green("✓")} Playlist ${bold(name)} créée`);
+    },
+  },
+
+  love: {
+    desc: "Ajouter le morceau en cours aux favoris",
+    run: () => {
+      const t = jxa<Track>(`
+        ${TRACK_PROPS}
+        const t = Music.currentTrack();
+        try { t.favorited = true; } catch { t.loved = true; }
+        return trackInfo(t);
+      `);
+      console.log(`${red("♥")} ${bold(t.name)} — ${t.artist}`);
+    },
+  },
+
+  unlove: {
+    desc: "Retirer le morceau en cours des favoris",
+    run: () => {
+      const t = jxa<Track>(`
+        ${TRACK_PROPS}
+        const t = Music.currentTrack();
+        try { t.favorited = false; } catch { t.loved = false; }
+        return trackInfo(t);
+      `);
+      console.log(`♡ ${bold(t.name)} — ${t.artist}`);
+    },
+  },
+
+  rate: {
+    desc: "Noter le morceau en cours (0-5 étoiles)",
+    usage: "am rate <0-5>",
+    run: (args) => {
+      const stars = Number(args[0]);
+      if (!(stars >= 0 && stars <= 5)) die("Usage : am rate <0-5>");
+      const t = jxa<Track>(`
+        ${TRACK_PROPS}
+        const t = Music.currentTrack();
+        t.rating = arg;
+        return trackInfo(t);
+      `, stars * 20);
+      console.log(`${green("✓")} ${"★".repeat(stars)}${dim("☆".repeat(5 - stars))} ${bold(t.name)}`);
+    },
+  },
+
+  volume: {
+    desc: "Afficher ou régler le volume (0-100)",
+    usage: "am volume [0-100]",
+    run: (args) => {
+      if (args[0] === undefined) {
+        const v = jxa<number>(`return Music.soundVolume()`);
+        console.log(`🔊 ${v}`);
+        return;
+      }
+      const v = Number(args[0]);
+      if (!(v >= 0 && v <= 100)) die("Usage : am volume [0-100]");
+      jxa(`Music.soundVolume = arg`, v);
+      console.log(`🔊 ${v}`);
+    },
+  },
+
+  shuffle: {
+    desc: "Activer/désactiver le mode aléatoire",
+    usage: "am shuffle [on|off]",
+    run: (args) => {
+      if (args[0] === "on" || args[0] === "off") {
+        jxa(`Music.shuffleEnabled = arg`, args[0] === "on");
+      }
+      const s = jxa<boolean>(`return Music.shuffleEnabled()`);
+      console.log(`🔀 shuffle ${s ? green("on") : dim("off")}`);
+    },
+  },
+
+  repeat: {
+    desc: "Mode répétition (off|one|all)",
+    usage: "am repeat [off|one|all]",
+    run: (args) => {
+      if (["off", "one", "all"].includes(args[0])) {
+        jxa(`Music.songRepeat = arg`, args[0]);
+      }
+      const r = jxa<string>(`return Music.songRepeat()`);
+      console.log(`🔁 repeat ${r === "off" ? dim("off") : green(r)}`);
+    },
+  },
+
+  recent: {
+    desc: "Derniers morceaux ajoutés à la bibliothèque",
+    usage: "am recent [--limit N]",
+    run: (args) => {
+      const { limit } = parseQuery(args);
+      const tracks = jxa<Track[]>(`
+        ${TRACK_PROPS}
+        const lib = Music.libraryPlaylists[0];
+        const ids = lib.tracks.persistentID();
+        const dates = lib.tracks.dateAdded();
+        const idx = dates.map((d, i) => [d, i]).sort((a, b) => b[0] - a[0]).slice(0, arg).map(x => x[1]);
+        return idx.map(i => trackInfo(lib.tracks[i]));
+      `, limit);
+      printTracks(tracks);
+    },
+  },
+
+  stats: {
+    desc: "Statistiques de la bibliothèque",
+    run: () => {
+      const s = jxa<{ tracks: number; duration: number; artists: number; albums: number }>(`
+        const lib = Music.libraryPlaylists[0];
+        const artists = new Set(lib.tracks.artist());
+        const albums = new Set(lib.tracks.album());
+        return {
+          tracks: lib.tracks.length,
+          duration: lib.duration(),
+          artists: artists.size,
+          albums: albums.size,
+        };
+      `);
+      const h = Math.floor(s.duration / 3600);
+      console.log(`  ${bold(String(s.tracks))} morceaux`);
+      console.log(`  ${bold(String(s.artists))} artistes, ${bold(String(s.albums))} albums`);
+      console.log(`  ${bold(String(h))} heures d'écoute`);
+    },
+  },
+
+  help: {
+    desc: "Afficher cette aide",
+    run: () => {
+      console.log(`${bold("am")} — Apple Music en ligne de commande\n`);
+      for (const [name, c] of Object.entries(commands)) {
+        console.log(`  ${bold(name.padEnd(14))} ${c.desc}${c.usage ? dim(`  (${c.usage})`) : ""}`);
+      }
+    },
+  },
+};
+
+function parseQuery(args: string[]): { query: string; limit: number } {
+  let limit = 20;
+  const li = args.indexOf("--limit");
+  if (li !== -1) {
+    limit = Number(args[li + 1]) || 20;
+    args = [...args.slice(0, li), ...args.slice(li + 2)];
+  }
+  return { query: args.join(" "), limit };
+}
+
+// ---------- main ----------
+
+const [cmd = "now", ...rest] = process.argv.slice(2);
+const command = commands[cmd];
+if (!command) {
+  console.error(`Commande inconnue : ${cmd}\n`);
+  commands.help.run([]);
+  process.exit(1);
+}
+command.run(rest);
