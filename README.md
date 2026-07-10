@@ -54,6 +54,22 @@ Les **écritures cloud** (`cloud-add`) demandent ton *Media User Token* :
 3. Copie la valeur du cookie `media-user-token`
 4. `am login '<token>'`
 
+### Playlists par IA (POC)
+
+| Commande | Effet |
+|---|---|
+| `am mix "<description>" [--limit N] [--name <nom>] [--dry-run]` | Décris la playlist que tu veux ; l'IA génère la tracklist, la résout contre le catalogue Apple Music et la crée dans ta bibliothèque cloud |
+
+```sh
+am mix "du funk égyptien des années 70 pour cuisiner" --limit 15
+am mix "montée progressive pour courir 45 minutes" --dry-run
+```
+
+Nécessite le Media User Token (`am login`) et une clé API Anthropic
+(`export ANTHROPIC_API_KEY='sk-ant-...'`). Le SDK `@anthropic-ai/sdk` est
+auto-installé par Bun au premier lancement — le CLI reste un seul fichier.
+`--dry-run` génère et résout sans rien créer.
+
 ### Playlists
 
 | Commande | Effet |

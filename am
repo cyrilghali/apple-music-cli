@@ -116,6 +116,7 @@ async function api(
     Authorization: `Bearer ${await getDevToken()}`,
     Origin: "https://music.apple.com",
   };
+  if (opts.body) headers["Content-Type"] = "application/json";
   if (opts.userToken) {
     if (!cfg.mediaUserToken) {
       die(
@@ -162,6 +163,105 @@ async function catalogSearch(query: string, limit: number): Promise<CatalogSong[
     `/v1/catalog/${sf}/search?term=${encodeURIComponent(query)}&types=songs&limit=${Math.min(limit, 25)}`
   );
   return res.results?.songs?.data ?? [];
+}
+
+// ---------- Génération de playlist par IA (POC) ----------
+
+interface MixTrack { title: string; artist: string }
+interface MixPlan { name: string; description: string; tracks: MixTrack[] }
+
+const MIX_SCHEMA = {
+  type: "object",
+  properties: {
+    name: { type: "string", description: "Nom court de la playlist" },
+    description: { type: "string", description: "Description en une phrase" },
+    tracks: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "Titre exact du morceau" },
+          artist: { type: "string", description: "Artiste principal" },
+        },
+        required: ["title", "artist"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["name", "description", "tracks"],
+  additionalProperties: false,
+};
+
+async function generateMixPlan(description: string, count: number, storefront: string): Promise<MixPlan> {
+  // Import dynamique : Bun auto-installe @anthropic-ai/sdk au premier usage,
+  // le reste du CLI ne déclenche jamais l'installation.
+  let Anthropic: any;
+  try {
+    Anthropic = (await import("@anthropic-ai/sdk")).default;
+  } catch (e) {
+    die(`Impossible de charger @anthropic-ai/sdk (réseau requis au premier lancement) : ${e}`);
+  }
+  let res: any;
+  try {
+    const client = new Anthropic();
+    res = await client.messages.create({
+      model: "claude-opus-4-8",
+      max_tokens: 16000,
+      thinking: { type: "adaptive" },
+      output_config: { format: { type: "json_schema", schema: MIX_SCHEMA } },
+      messages: [
+        {
+          role: "user",
+          content:
+            `Tu génères une playlist Apple Music à partir de cette demande : « ${description} ».\n` +
+            `Storefront de l'utilisateur : ${storefront}.\n` +
+            `Propose exactement ${count} morceaux RÉELS disponibles en streaming sur Apple Music — ` +
+            `pas de titres inventés, pas de doublons, un seul morceau par artiste sauf si la demande impose le contraire. ` +
+            `Respecte l'intention de la demande (ambiance, époque, langue, énergie) et l'ordre d'écoute ` +
+            `(si une progression est demandée, ordonne les morceaux en conséquence). ` +
+            `Donne un nom de playlist court et une description d'une phrase, dans la langue de la demande.`,
+        },
+      ],
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (/resolve authentication|api.?key|authentication_error/i.test(msg)) {
+      die(
+        "Clé API Anthropic introuvable ou invalide.\n" +
+        "  export ANTHROPIC_API_KEY='sk-ant-...'   (console.anthropic.com → API Keys)"
+      );
+    }
+    die(`Appel Claude échoué : ${msg}`);
+  }
+  if (res.stop_reason === "refusal") die("Génération refusée par le modèle — reformule ta demande.");
+  const text = res.content.find((b: any) => b.type === "text")?.text;
+  if (!text) die("Réponse du modèle vide.");
+  return JSON.parse(text) as MixPlan;
+}
+
+/** Résout un morceau proposé contre le catalogue. Renvoie null si introuvable. */
+async function resolveMixTrack(t: MixTrack): Promise<{ track: MixTrack; song: CatalogSong | null; exact: boolean }> {
+  const results = await catalogSearch(`${t.title} ${t.artist}`, 5);
+  if (results.length === 0) return { track: t, song: null, exact: false };
+  const norm = (s: string) => s.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  const wanted = norm(t.artist);
+  const match = results.find((r) => {
+    const got = norm(r.attributes.artistName);
+    return got.includes(wanted) || wanted.includes(got);
+  });
+  return { track: t, song: match ?? results[0], exact: !!match };
+}
+
+async function createCloudPlaylist(name: string, description: string, songIds: string[]): Promise<string | null> {
+  const res = await api("/v1/me/library/playlists", {
+    method: "POST",
+    userToken: true,
+    body: {
+      attributes: { name, description },
+      relationships: { tracks: { data: songIds.map((id) => ({ id, type: "songs" })) } },
+    },
+  });
+  return res?.data?.[0]?.id ?? null;
 }
 
 function printCatalog(songs: CatalogSong[]) {
@@ -505,6 +605,65 @@ const commands: Record<string, { desc: string; usage?: string; run: (args: strin
     },
   },
 
+  mix: {
+    desc: "Générer une playlist par IA et la créer dans ta bibliothèque cloud",
+    usage: 'am mix "<description>" [--limit N] [--name <nom>] [--dry-run]',
+    run: async (args) => {
+      const dryRun = args.includes("--dry-run");
+      args = args.filter((a) => a !== "--dry-run");
+      let name: string | undefined;
+      const ni = args.indexOf("--name");
+      if (ni !== -1) {
+        name = args[ni + 1];
+        args = [...args.slice(0, ni), ...args.slice(ni + 2)];
+      }
+      const { query: description, limit } = parseQuery(args);
+      if (!description) die('Usage : am mix "<description>" [--limit N] [--name <nom>] [--dry-run]');
+
+      // Le token utilisateur est requis pour committer — on échoue avant de payer un appel LLM.
+      if (!dryRun && !loadConfig().mediaUserToken) {
+        die("am mix a besoin de ton Media User Token pour créer la playlist — lance `am login` pour la marche à suivre, ou utilise --dry-run.");
+      }
+
+      const sf = await getStorefront();
+      console.log(dim(`Génération de la playlist (${limit} morceaux)…`));
+      const plan = await generateMixPlan(description, limit, sf);
+
+      console.log(dim("Résolution contre le catalogue Apple Music…"));
+      const resolved: Awaited<ReturnType<typeof resolveMixTrack>>[] = [];
+      const CHUNK = 8;
+      for (let i = 0; i < plan.tracks.length; i += CHUNK) {
+        resolved.push(...(await Promise.all(plan.tracks.slice(i, i + CHUNK).map(resolveMixTrack))));
+      }
+
+      const found = resolved.filter((r) => r.song);
+      const missed = resolved.filter((r) => !r.song);
+      const playlistName = name ?? plan.name;
+
+      console.log(`\n${bold(playlistName)} — ${dim(plan.description)}`);
+      for (const r of resolved) {
+        if (r.song) {
+          const a = r.song.attributes;
+          console.log(`  ${green("✓")} ${bold(a.name)} — ${a.artistName}${r.exact ? "" : dim("  (correspondance approximative)")}`);
+        } else {
+          console.log(`  ${red("✗")} ${r.track.title} — ${r.track.artist} ${dim("(introuvable au catalogue)")}`);
+        }
+      }
+      if (found.length === 0) die("Aucun morceau résolu — playlist non créée.");
+
+      if (dryRun) {
+        console.log(dim(`\n--dry-run : rien n'a été créé (${found.length}/${resolved.length} morceaux résolus).`));
+        return;
+      }
+
+      const seen = new Set<string>();
+      const ids = found.map((r) => r.song!.id).filter((id) => !seen.has(id) && (seen.add(id), true));
+      await createCloudPlaylist(playlistName, plan.description, ids);
+      console.log(`\n${green("✓")} Playlist ${bold(playlistName)} créée avec ${ids.length} morceaux dans ta bibliothèque cloud`);
+      console.log(dim("  (la synchro dans Music.app peut prendre quelques secondes)"));
+    },
+  },
+
   login: {
     desc: "Enregistrer ton Media User Token (écritures cloud)",
     usage: "am login <media-user-token>",
@@ -617,4 +776,8 @@ if (!command) {
   commands.help.run([]);
   process.exit(1);
 }
-await command.run(rest);
+try {
+  await command.run(rest);
+} catch (e) {
+  die(e instanceof Error ? e.message : String(e));
+}
