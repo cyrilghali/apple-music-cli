@@ -1,0 +1,26 @@
+am
+  s_c862e5c066a518::t_59fa945ef99e46 119
+  s_c862e5c066a518::t_dfd06dd9a2e025 608-666
+  s_c862e5c066a518::t_9cc046c9dd0b0a 779-783
+  s_c862e5c066a518::t_a3f4ba9281bd4c 168-203,205,235-245,247-266
+  s_c862e5c066a518::t_22f858a3331d8c 246
+  s_c862e5c066a518::t_f039a8f2310042 204,206-234
+README.md
+  s_c862e5c066a518::t_a7b0fcc18411eb 57-72
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.11",
+  "base_commit_sha": "077f70155ac11593621e1874ee23c829d01a1598",
+  "prompts": {},
+  "sessions": {
+    "s_c862e5c066a518": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3bac283b-0f0e-43ad-a624-6486f774bfef",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Cyril GHALI <cyril.ghali@tryriot.com>"
+    }
+  }
+}
