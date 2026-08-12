@@ -70,6 +70,27 @@ Nécessite le Media User Token (`am login`) et une clé API Anthropic
 auto-installé par Bun au premier lancement — le CLI reste un seul fichier.
 `--dry-run` génère et résout sans rien créer.
 
+### Export Spotify
+
+| Commande | Effet |
+|---|---|
+| `am spotify-login [client-id]` | Connecter ton compte Spotify / afficher l'état |
+| `am spotify <playlist> [--name <nom>] [--private] [--dry-run]` | Exporter une playlist Apple Music vers Spotify |
+
+Configuration unique (gratuite) :
+
+1. Va sur <https://developer.spotify.com/dashboard> → « Create app »
+2. Redirect URI **exactement** `http://127.0.0.1:8888/callback` (Spotify n'accepte plus `localhost`), coche « Web API »
+3. Copie le **Client ID**
+4. `am spotify-login <client-id>` — une fenêtre s'ouvre pour autoriser l'accès
+
+```sh
+am spotify "Funk Egyptien 70s"
+am spotify "Funk Egyptien 70s" --name "My Funk Playlist" --private --dry-run
+```
+
+L'export cherche chaque morceau par titre + artiste : quelques pistes peuvent manquer si elles ne sont pas disponibles sur Spotify. Les absences sont indiquées par `✗` dans la sortie.
+
 ### Playlists
 
 | Commande | Effet |

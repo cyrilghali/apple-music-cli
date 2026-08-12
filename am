@@ -5,6 +5,7 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
 
 // ---------- JXA bridge ----------
 
@@ -59,6 +60,7 @@ interface Config {
   devToken?: string;
   mediaUserToken?: string;
   storefront?: string;
+  spotify?: { clientId: string; refreshToken?: string };
 }
 
 function loadConfig(): Config {
@@ -165,6 +167,141 @@ async function catalogSearch(query: string, limit: number): Promise<CatalogSong[
   return res.results?.songs?.data ?? [];
 }
 
+// ---------- Spotify ----------
+
+const norm = (s: string) => s.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+
+const SPOTIFY_REDIRECT = "http://127.0.0.1:8888/callback";
+let _spotifyAccessToken: string | null = null;
+
+async function spotifyAuthorize(clientId: string): Promise<void> {
+  const verifier = Buffer.from(randomBytes(64)).toString("base64url");
+  const challenge = Buffer.from(createHash("sha256").update(verifier).digest()).toString("base64url");
+  const state = Buffer.from(randomBytes(16)).toString("base64url");
+
+  const params = new URLSearchParams({
+    client_id: clientId,
+    response_type: "code",
+    redirect_uri: SPOTIFY_REDIRECT,
+    code_challenge_method: "S256",
+    code_challenge: challenge,
+    state,
+    scope: "playlist-modify-public playlist-modify-private",
+  });
+  const authUrl = `https://accounts.spotify.com/authorize?${params}`;
+
+  let code: string | null = null;
+  let server!: ReturnType<typeof Bun.serve>;
+  try {
+    server = Bun.serve({
+      port: 8888,
+      fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname !== "/callback") return new Response("Not Found", { status: 404 });
+        const returnedState = url.searchParams.get("state");
+        const returnedCode = url.searchParams.get("code");
+        const error = url.searchParams.get("error");
+        if (returnedState !== state) return new Response("État invalide.", { status: 400 });
+        if (error || !returnedCode) return new Response(`Erreur Spotify : ${error ?? "code manquant"}`, { status: 400 });
+        code = returnedCode;
+        return new Response(
+          `<!doctype html><html><body style="font-family:sans-serif;text-align:center;padding:2rem"><h2>✓ Connecté à Spotify — tu peux fermer cet onglet.</h2></body></html>`,
+          { headers: { "Content-Type": "text/html;charset=utf-8" } }
+        );
+      },
+    });
+  } catch {
+    die("Le port 8888 est occupé — ferme le processus qui l'utilise et relance.");
+  }
+
+  spawnSync("open", [authUrl]);
+  console.log(dim("En attente de l'autorisation Spotify dans le navigateur…"));
+
+  while (code === null) await Bun.sleep(200);
+  server.stop();
+
+  const tokenRes = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      code: code!,
+      redirect_uri: SPOTIFY_REDIRECT,
+      client_id: clientId,
+      code_verifier: verifier,
+    }),
+  });
+  if (!tokenRes.ok) die(`Échange de token Spotify échoué : ${tokenRes.status} ${await tokenRes.text()}`);
+  const tokens = await tokenRes.json();
+  if (!tokens.refresh_token) die("Spotify n'a pas renvoyé de refresh_token — réessaie.");
+  saveConfig({ ...loadConfig(), spotify: { clientId, refreshToken: tokens.refresh_token } });
+}
+
+async function spotifyToken(): Promise<string> {
+  if (_spotifyAccessToken) return _spotifyAccessToken;
+  const cfg = loadConfig();
+  if (!cfg.spotify?.clientId || !cfg.spotify?.refreshToken) {
+    die("Compte Spotify non connecté.\n  Lance : am spotify-login <client-id>");
+  }
+  const res = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: cfg.spotify.refreshToken!,
+      client_id: cfg.spotify.clientId,
+    }),
+  });
+  if (!res.ok) die(`Rafraîchissement du token Spotify échoué : ${res.status} ${await res.text()}`);
+  const data = await res.json();
+  const token = data.access_token as string;
+  _spotifyAccessToken = token;
+  if (data.refresh_token) saveConfig({ ...loadConfig(), spotify: { clientId: cfg.spotify.clientId, refreshToken: data.refresh_token } });
+  return token;
+}
+
+async function spotifyApi(path: string, opts: { method?: string; body?: unknown } = {}): Promise<any> {
+  const token = await spotifyToken();
+  const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
+  if (opts.body) headers["Content-Type"] = "application/json";
+  while (true) {
+    const res = await fetch(`https://api.spotify.com${path}`, {
+      method: opts.method ?? "GET",
+      headers,
+      body: opts.body ? JSON.stringify(opts.body) : undefined,
+    });
+    if (res.status === 429) {
+      await Bun.sleep(Number(res.headers.get("Retry-After") ?? "1") * 1000);
+      continue;
+    }
+    if (res.status === 401 || res.status === 403) {
+      die(`API Spotify : accès refusé (${res.status}). Refais \`am spotify-login\`.`);
+    }
+    if (!res.ok) die(`API Spotify : ${res.status} ${await res.text()}`);
+    return res.status === 204 ? null : res.json();
+  }
+}
+
+interface SpotifyMatch { uri: string; name: string; artist: string; exact: boolean }
+
+async function spotifySearchTrack(t: { name: string; artist: string }): Promise<SpotifyMatch | null> {
+  const cleanName = t.name.replace(/"/g, "");
+  const cleanArtist = t.artist.replace(/"/g, "");
+  const trySearch = async (q: string) => {
+    const res = await spotifyApi(`/v1/search?q=${encodeURIComponent(q)}&type=track&limit=5`);
+    return (res.tracks?.items ?? []) as any[];
+  };
+  let items = await trySearch(`track:"${cleanName}" artist:"${cleanArtist}"`);
+  if (items.length === 0) items = await trySearch(`${cleanName} ${cleanArtist}`);
+  if (items.length === 0) return null;
+  const wanted = norm(t.artist);
+  const match = items.find((item: any) =>
+    item.artists.some((a: any) => { const g = norm(a.name); return g.includes(wanted) || wanted.includes(g); })
+  );
+  const pick = match ?? items[0];
+  return { uri: pick.uri, name: pick.name, artist: pick.artists[0]?.name ?? "", exact: !!match };
+}
+
 // ---------- Génération de playlist par IA (POC) ----------
 
 interface MixTrack { title: string; artist: string }
@@ -243,7 +380,6 @@ async function generateMixPlan(description: string, count: number, storefront: s
 async function resolveMixTrack(t: MixTrack): Promise<{ track: MixTrack; song: CatalogSong | null; exact: boolean }> {
   const results = await catalogSearch(`${t.title} ${t.artist}`, 5);
   if (results.length === 0) return { track: t, song: null, exact: false };
-  const norm = (s: string) => s.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
   const wanted = norm(t.artist);
   const match = results.find((r) => {
     const got = norm(r.attributes.artistName);
@@ -687,6 +823,105 @@ const commands: Record<string, { desc: string; usage?: string; run: (args: strin
       saveConfig({ ...loadConfig(), mediaUserToken: token, storefront: undefined });
       const sf = await getStorefront();
       console.log(`${green("✓")} Token enregistré (storefront : ${bold(sf)})`);
+    },
+  },
+
+  "spotify-login": {
+    desc: "Connecter ton compte Spotify (export de playlists)",
+    usage: "am spotify-login [client-id]",
+    run: async (args) => {
+      const cfg = loadConfig();
+      const clientId = args[0] ?? cfg.spotify?.clientId;
+      if (!clientId) {
+        console.log(`Client ID Spotify : ${cfg.spotify?.clientId ? green(cfg.spotify.clientId) : red("absent")}`);
+        console.log(`Refresh token    : ${cfg.spotify?.refreshToken ? green("enregistré") : red("absent")}`);
+        console.log(
+          "\nPour configurer l'export Spotify :\n" +
+          "  1. Va sur https://developer.spotify.com/dashboard → « Create app »\n" +
+          `  2. Redirect URI exactement : ${bold("http://127.0.0.1:8888/callback")}\n` +
+          "     (Spotify n'accepte plus localhost), coche « Web API »\n" +
+          `  3. Copie le ${bold("Client ID")}\n` +
+          "  4. Lance : am spotify-login <client-id>"
+        );
+        return;
+      }
+      await spotifyAuthorize(clientId);
+      console.log(`${green("✓")} Compte Spotify connecté`);
+    },
+  },
+
+  spotify: {
+    desc: "Exporter une playlist vers Spotify (lien partageable)",
+    usage: "am spotify <playlist> [--name <nom>] [--private] [--dry-run]",
+    run: async (args) => {
+      const dryRun = args.includes("--dry-run");
+      args = args.filter((a) => a !== "--dry-run");
+      const isPrivate = args.includes("--private");
+      args = args.filter((a) => a !== "--private");
+      let overrideName: string | undefined;
+      const ni = args.indexOf("--name");
+      if (ni !== -1) { overrideName = args[ni + 1]; args = [...args.slice(0, ni), ...args.slice(ni + 2)]; }
+      const playlistName = args.join(" ");
+      if (!playlistName) die("Usage : am spotify <playlist> [--name <nom>] [--private] [--dry-run]");
+
+      if (!loadConfig().spotify?.refreshToken) {
+        die("Compte Spotify non connecté — lance `am spotify-login` pour la marche à suivre.");
+      }
+
+      const tracks = jxa<{ name: string; artist: string }[]>(`
+        ${PLAYLIST_HELPERS}
+        const pl = playlistByName(arg);
+        try {
+          const names = pl.tracks.name();
+          const artists = pl.tracks.artist();
+          return names.map((n, i) => ({ name: n, artist: artists[i] }));
+        } catch { return []; }
+      `, playlistName);
+
+      if (tracks.length === 0) die("Playlist vide : rien à exporter.");
+
+      console.log(dim(`Recherche de ${tracks.length} morceau${tracks.length > 1 ? "x" : ""} sur Spotify…`));
+      const results: (SpotifyMatch | null)[] = [];
+      const CHUNK = 8;
+      for (let i = 0; i < tracks.length; i += CHUNK) {
+        results.push(...(await Promise.all(tracks.slice(i, i + CHUNK).map(spotifySearchTrack))));
+      }
+
+      const finalName = overrideName ?? playlistName;
+      console.log(`\n${bold(finalName)}`);
+      for (let i = 0; i < tracks.length; i++) {
+        const t = tracks[i];
+        const r = results[i];
+        if (r) {
+          console.log(`  ${green("✓")} ${bold(r.name)} — ${r.artist}${r.exact ? "" : dim("  (correspondance approximative)")}`);
+        } else {
+          console.log(`  ${red("✗")} ${t.name} — ${t.artist} ${dim("(introuvable sur Spotify)")}`);
+        }
+      }
+
+      const found = results.filter(Boolean) as SpotifyMatch[];
+      if (found.length === 0) die("Aucun morceau trouvé sur Spotify — playlist non créée.");
+
+      if (dryRun) {
+        console.log(dim(`\n--dry-run : rien n'a été créé (${found.length}/${tracks.length} morceaux trouvés).`));
+        return;
+      }
+
+      const playlist = await spotifyApi("/v1/me/playlists", {
+        method: "POST",
+        body: { name: finalName, public: !isPrivate, description: "Exportée d'Apple Music avec am" },
+      });
+
+      const seen = new Set<string>();
+      const uris = found.map((r) => r.uri).filter((uri) => !seen.has(uri) && (seen.add(uri), true));
+      for (let i = 0; i < uris.length; i += 100) {
+        await spotifyApi(`/v1/playlists/${playlist.id}/tracks`, { method: "POST", body: { uris: uris.slice(i, i + 100) } });
+      }
+
+      const missed = tracks.length - found.length;
+      console.log(`\n${green("✓")} Playlist ${bold(finalName)} créée sur Spotify (${found.length}/${tracks.length} morceaux)`);
+      console.log(bold(playlist.external_urls.spotify));
+      if (missed > 0) console.log(dim(`${missed} morceau${missed > 1 ? "x" : ""} introuvable${missed > 1 ? "s" : ""} — voir ✗ ci-dessus.`));
     },
   },
 
