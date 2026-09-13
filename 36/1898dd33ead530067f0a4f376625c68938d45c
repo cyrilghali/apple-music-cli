@@ -1,0 +1,21 @@
+README.md
+  s_d7bc9177c0e7b0::t_baf3c76a11ca8e 80,98-100
+am
+  s_d7bc9177c0e7b0::t_43bcdbf5294ca5 263-267,279-281,356,377-379,790,996-1009,1019-1026,1029-1049,1052-1086,1088-1113
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "361898dd33ead530067f0a4f376625c68938d45c",
+  "prompts": {},
+  "sessions": {
+    "s_d7bc9177c0e7b0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ff3ae665-5ef3-52a3-b31e-849270489d2c",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Cyril GHALI <cyril.ghali@tryriot.com>"
+    }
+  }
+}
