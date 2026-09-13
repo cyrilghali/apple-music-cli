@@ -186,7 +186,7 @@ async function spotifyAuthorize(clientId: string): Promise<void> {
     code_challenge_method: "S256",
     code_challenge: challenge,
     state,
-    scope: "playlist-modify-public playlist-modify-private",
+    scope: "playlist-modify-public playlist-modify-private user-library-modify",
   });
   const authUrl = `https://accounts.spotify.com/authorize?${params}`;
 
@@ -278,29 +278,46 @@ async function spotifyApi(path: string, opts: { method?: string; body?: unknown 
       die(`API Spotify : accès refusé (${res.status}). Refais \`am spotify-login\`.`);
     }
     if (!res.ok) die(`API Spotify : ${res.status} ${await res.text()}`);
-    return res.status === 204 ? null : res.json();
+    const text = await res.text();
+    return text ? JSON.parse(text) : null;
   }
 }
 
 interface SpotifyMatch { uri: string; name: string; artist: string; exact: boolean }
 
-async function spotifySearchTrack(t: { name: string; artist: string }): Promise<SpotifyMatch | null> {
-  const cleanName = t.name.replace(/"/g, "");
-  const cleanArtist = t.artist.replace(/"/g, "");
+const simplifyTitle = (s: string) => s.replace(/\s*[(\[].*?[)\]]/g, "").replace(/\s+-\s+.*$/, "").trim();
+const mainArtist = (s: string) => s.split(/\s*(?:,|&|feat\.?|ft\.?|\/|;)\s*/i)[0].trim();
+
+async function spotifySearchTrack(t: { name: string; artist: string; album?: string }): Promise<SpotifyMatch | null> {
+  const name = t.name.replace(/"/g, "");
+  const artist = t.artist.replace(/"/g, "");
+  const shortName = simplifyTitle(name);
+  const firstArtist = mainArtist(artist);
   const trySearch = async (q: string) => {
     const res = await spotifyApi(`/v1/search?q=${encodeURIComponent(q)}&type=track&limit=5`);
     return (res.tracks?.items ?? []) as any[];
   };
-  let items = await trySearch(`track:"${cleanName}" artist:"${cleanArtist}"`);
-  if (items.length === 0) items = await trySearch(`${cleanName} ${cleanArtist}`);
+  let items = await trySearch(`track:"${name}" artist:"${artist}"`);
+  if (items.length === 0) items = await trySearch(`${name} ${artist}`);
+  if (items.length === 0 && (shortName !== name || firstArtist !== artist)) {
+    items = await trySearch(`track:"${shortName}" artist:"${firstArtist}"`);
+  }
   if (items.length === 0) return null;
-  const wanted = norm(t.artist);
-  const match = items.find((item: any) =>
+  const wanted = norm(firstArtist);
+  const byArtist = items.filter((item: any) =>
     item.artists.some((a: any) => { const g = norm(a.name); return g.includes(wanted) || wanted.includes(g); })
   );
-  const pick = match ?? items[0];
-  return { uri: pick.uri, name: pick.name, artist: pick.artists[0]?.name ?? "", exact: !!match };
+  const sameAlbum = t.album ? byArtist.find((i: any) => norm(i.album?.name ?? "") === norm(t.album!)) : undefined;
+  const pick = sameAlbum ?? byArtist[0] ?? items[0];
+  return { uri: pick.uri, name: pick.name, artist: pick.artists[0]?.name ?? "", exact: byArtist.length > 0 };
 }
+
+// Appariements Apple Music → Spotify, par persistentID (null = introuvable), pour reprendre une migration interrompue.
+const MATCHES_PATH = join(CONFIG_DIR, "spotify-matches.json");
+const UNMATCHED_PATH = join(CONFIG_DIR, "spotify-unmatched.txt");
+type Matches = Record<string, string | null>;
+const loadMatches = (): Matches => { try { return JSON.parse(readFileSync(MATCHES_PATH, "utf8")); } catch { return {}; } };
+const saveMatches = (m: Matches) => { mkdirSync(CONFIG_DIR, { recursive: true }); writeFileSync(MATCHES_PATH, JSON.stringify(m)); };
 
 // ---------- Génération de playlist par IA (POC) ----------
 
@@ -837,7 +854,7 @@ const commands: Record<string, { desc: string; usage?: string; run: (args: strin
         console.log(`Refresh token    : ${cfg.spotify?.refreshToken ? green("enregistré") : red("absent")}`);
         console.log(
           "\nPour configurer l'export Spotify :\n" +
-          "  1. Va sur https://developer.spotify.com/dashboard → « Create app »\n" +
+          "  1. Va sur https://developer.spotify.com/dashboard → « Create app » (compte Premium requis)\n" +
           `  2. Redirect URI exactement : ${bold("http://127.0.0.1:8888/callback")}\n` +
           "     (Spotify n'accepte plus localhost), coche « Web API »\n" +
           `  3. Copie le ${bold("Client ID")}\n` +
@@ -915,13 +932,105 @@ const commands: Record<string, { desc: string; usage?: string; run: (args: strin
       const seen = new Set<string>();
       const uris = found.map((r) => r.uri).filter((uri) => !seen.has(uri) && (seen.add(uri), true));
       for (let i = 0; i < uris.length; i += 100) {
-        await spotifyApi(`/v1/playlists/${playlist.id}/tracks`, { method: "POST", body: { uris: uris.slice(i, i + 100) } });
+        await spotifyApi(`/v1/playlists/${playlist.id}/items`, { method: "POST", body: { uris: uris.slice(i, i + 100) } });
       }
 
       const missed = tracks.length - found.length;
       console.log(`\n${green("✓")} Playlist ${bold(finalName)} créée sur Spotify (${found.length}/${tracks.length} morceaux)`);
       console.log(bold(playlist.external_urls.spotify));
       if (missed > 0) console.log(dim(`${missed} morceau${missed > 1 ? "x" : ""} introuvable${missed > 1 ? "s" : ""} — voir ✗ ci-dessus.`));
+    },
+  },
+
+  "spotify-library": {
+    desc: "Migrer toute la bibliothèque vers Spotify (titres likés + playlists)",
+    usage: "am spotify-library [--liked-only|--playlists-only] [--public] [--dry-run]",
+    run: async (args) => {
+      const dryRun = args.includes("--dry-run");
+      const doLiked = !args.includes("--playlists-only");
+      const doPlaylists = !args.includes("--liked-only");
+      const isPublic = args.includes("--public");
+      if (!loadConfig().spotify?.refreshToken) {
+        die("Compte Spotify non connecté — lance `am spotify-login` pour la marche à suivre.");
+      }
+
+      console.log(dim("Lecture de la bibliothèque Apple Music…"));
+      const library = jxa<{ id: string; name: string; artist: string; album: string }[]>(`
+        const lib = Music.libraryPlaylists[0];
+        const ids = lib.tracks.persistentID(), names = lib.tracks.name(), artists = lib.tracks.artist(),
+              albums = lib.tracks.album(), added = lib.tracks.dateAdded();
+        return ids.map((id, i) => ({ id, name: names[i], artist: artists[i], album: albums[i], added: added[i] }))
+          .sort((a, b) => a.added - b.added);
+      `);
+      type LibTrack = (typeof library)[number];
+      const playlists = jxa<{ name: string; tracks: LibTrack[] }[]>(`
+        const tracksOf = (pl) => {
+          try {
+            const ids = pl.tracks.persistentID(), names = pl.tracks.name(), artists = pl.tracks.artist(), albums = pl.tracks.album();
+            return ids.map((id, i) => ({ id, name: names[i], artist: artists[i], album: albums[i] }));
+          } catch { return []; }
+        };
+        return Music.playlists()
+          .filter(p => { try { return p.specialKind() === "none"; } catch { return true; } })
+          .filter(p => !["Library", "Music"].includes(p.name()))
+          .map(p => ({ name: p.name(), tracks: tracksOf(p) }));
+      `);
+      const byId = new Map([...library, ...playlists.flatMap((p) => p.tracks)].map((t) => [t.id, t]));
+      const wantedIds = new Set([
+        ...(doLiked ? library : []).map((t) => t.id),
+        ...(doPlaylists ? playlists.flatMap((p) => p.tracks) : []).map((t) => t.id),
+      ]);
+      const needed = [...wantedIds].map((id) => byId.get(id)!);
+
+      const matches = loadMatches();
+      const todo = needed.filter((t) => !(t.id in matches));
+      console.log(dim(`${needed.length} morceaux, ${todo.length} à chercher sur Spotify (les autres sont déjà appariés)…`));
+      const CHUNK = 4;
+      for (let i = 0; i < todo.length; i += CHUNK) {
+        const batch = todo.slice(i, i + CHUNK);
+        const found = await Promise.all(batch.map(spotifySearchTrack));
+        batch.forEach((t, j) => { matches[t.id] = found[j]?.uri ?? null; });
+        const done = Math.min(i + CHUNK, todo.length);
+        if (done % 100 < CHUNK || done === todo.length) { saveMatches(matches); process.stdout.write(`\r  ${done}/${todo.length}`); }
+      }
+      if (todo.length) console.log();
+
+      const unmatched = needed.filter((t) => matches[t.id] === null);
+      writeFileSync(UNMATCHED_PATH, unmatched.map((t) => `${t.name} — ${t.artist} — ${t.album}`).join("\n") + "\n");
+      console.log(`${green("✓")} ${needed.length - unmatched.length}/${needed.length} morceaux trouvés sur Spotify` +
+        (unmatched.length ? dim(` — ${unmatched.length} introuvables listés dans ${UNMATCHED_PATH}`) : ""));
+      if (dryRun) { console.log(dim("--dry-run : rien n'a été écrit sur Spotify.")); return; }
+
+      if (doLiked) {
+        const uris = [...new Set(library.map((t) => matches[t.id]).filter(Boolean))] as string[];
+        for (let i = 0; i < uris.length; i += 40) {
+          await spotifyApi(`/v1/me/library?uris=${encodeURIComponent(uris.slice(i, i + 40).join(","))}`, { method: "PUT" });
+          process.stdout.write(`\r  Titres likés : ${Math.min(i + 40, uris.length)}/${uris.length}`);
+        }
+        console.log(`\r${green("✓")} ${uris.length} titres likés sur Spotify (du plus ancien au plus récent)`);
+      }
+
+      if (doPlaylists) {
+        const existing = new Set<string>();
+        for (let offset = 0; ; offset += 50) {
+          const page = await spotifyApi(`/v1/me/playlists?limit=50&offset=${offset}`);
+          for (const p of page.items ?? []) existing.add(p.name);
+          if (!page.next) break;
+        }
+        for (const pl of playlists) {
+          const uris = [...new Set(pl.tracks.map((t) => matches[t.id]).filter(Boolean))] as string[];
+          if (uris.length === 0) { console.log(`  ${dim("–")} ${pl.name} ${dim("(vide ou introuvable, ignorée)")}`); continue; }
+          if (existing.has(pl.name)) { console.log(`  ${dim("=")} ${pl.name} ${dim("(déjà sur Spotify, ignorée)")}`); continue; }
+          const created = await spotifyApi("/v1/me/playlists", {
+            method: "POST",
+            body: { name: pl.name, public: isPublic, description: "Importée d'Apple Music avec am" },
+          });
+          for (let i = 0; i < uris.length; i += 100) {
+            await spotifyApi(`/v1/playlists/${created.id}/items`, { method: "POST", body: { uris: uris.slice(i, i + 100) } });
+          }
+          console.log(`  ${green("✓")} ${pl.name} ${dim(`(${uris.length}/${pl.tracks.length})`)}`);
+        }
+      }
     },
   },
 

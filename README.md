@@ -76,8 +76,9 @@ auto-installé par Bun au premier lancement — le CLI reste un seul fichier.
 |---|---|
 | `am spotify-login [client-id]` | Connecter ton compte Spotify / afficher l'état |
 | `am spotify <playlist> [--name <nom>] [--private] [--dry-run]` | Exporter une playlist Apple Music vers Spotify |
+| `am spotify-library [--liked-only\|--playlists-only] [--public] [--dry-run]` | Migrer toute la bibliothèque : titres likés + playlists |
 
-Configuration unique (gratuite) :
+Configuration unique (compte Spotify Premium requis depuis février 2026) :
 
 1. Va sur <https://developer.spotify.com/dashboard> → « Create app »
 2. Redirect URI **exactement** `http://127.0.0.1:8888/callback` (Spotify n'accepte plus `localhost`), coche « Web API »
@@ -87,9 +88,13 @@ Configuration unique (gratuite) :
 ```sh
 am spotify "Funk Egyptien 70s"
 am spotify "Funk Egyptien 70s" --name "My Funk Playlist" --private --dry-run
+am spotify-library --dry-run   # apparie tout, n'écrit rien
+am spotify-library             # like chaque morceau de la bibliothèque, recrée chaque playlist (privée)
 ```
 
-L'export cherche chaque morceau par titre + artiste : quelques pistes peuvent manquer si elles ne sont pas disponibles sur Spotify. Les absences sont indiquées par `✗` dans la sortie.
+L'export cherche chaque morceau par titre + artiste (puis titre simplifié + artiste principal), l'album départage les doublons. Quelques pistes peuvent manquer si elles ne sont pas disponibles sur Spotify : `✗` dans la sortie de `am spotify`, fichier `~/.config/am/spotify-unmatched.txt` pour `am spotify-library`.
+
+`am spotify-library` est relançable : les appariements sont mémorisés dans `~/.config/am/spotify-matches.json`, liker un titre déjà liké est sans effet et une playlist portant déjà le même nom sur Spotify est ignorée. Les titres sont likés du plus ancien au plus récent pour retrouver l'ordre d'Apple Music.
 
 ### Playlists
 
