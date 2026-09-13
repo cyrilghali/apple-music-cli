@@ -1,0 +1,21 @@
+README.md
+  s_d7bc9177c0e7b0::t_9bc28c2fcafa3a 1-58
+am
+  s_d7bc9177c0e7b0::t_7b20e390d135e9 1-371
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b48431b3c858c6e7b985ae8ddd7c9014651e4617",
+  "prompts": {},
+  "sessions": {
+    "s_d7bc9177c0e7b0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ff3ae665-5ef3-52a3-b31e-849270489d2c",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Cyril GHALI <cyril.ghali@tryriot.com>"
+    }
+  }
+}
