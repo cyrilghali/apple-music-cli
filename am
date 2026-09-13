@@ -260,6 +260,11 @@ async function spotifyToken(): Promise<string> {
   return token;
 }
 
+// Un Retry-After de plusieurs heures est le quota journalier des apps en Development Mode : on s'arrête proprement, on reprend le lendemain.
+class SpotifyQuotaExhausted extends Error {
+  constructor(public retryAfter: number) { super(`Quota Spotify atteint, réessaie dans ${Math.ceil(retryAfter / 3600)} h`); }
+}
+
 async function spotifyApi(path: string, opts: { method?: string; body?: unknown } = {}): Promise<any> {
   const token = await spotifyToken();
   const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
@@ -271,7 +276,9 @@ async function spotifyApi(path: string, opts: { method?: string; body?: unknown 
       body: opts.body ? JSON.stringify(opts.body) : undefined,
     });
     if (res.status === 429) {
-      await Bun.sleep(Number(res.headers.get("Retry-After") ?? "1") * 1000);
+      const retryAfter = Number(res.headers.get("Retry-After") ?? "1");
+      if (retryAfter > 300) throw new SpotifyQuotaExhausted(retryAfter);
+      await Bun.sleep(retryAfter * 1000);
       continue;
     }
     if (res.status === 401 || res.status === 403) {
@@ -346,7 +353,7 @@ const MIX_SCHEMA = {
   additionalProperties: false,
 };
 
-async function generateMixPlan(description: string, count: number, storefront: string): Promise<MixPlan> {
+async function generateMixPlan(description: string, count: number, target: { service: string; storefront?: string }): Promise<MixPlan> {
   // Import dynamique : Bun auto-installe @anthropic-ai/sdk au premier usage,
   // le reste du CLI ne déclenche jamais l'installation.
   let Anthropic: any;
@@ -367,9 +374,9 @@ async function generateMixPlan(description: string, count: number, storefront: s
         {
           role: "user",
           content:
-            `Tu génères une playlist Apple Music à partir de cette demande : « ${description} ».\n` +
-            `Storefront de l'utilisateur : ${storefront}.\n` +
-            `Propose exactement ${count} morceaux RÉELS disponibles en streaming sur Apple Music — ` +
+            `Tu génères une playlist ${target.service} à partir de cette demande : « ${description} ».\n` +
+            (target.storefront ? `Storefront de l'utilisateur : ${target.storefront}.\n` : "") +
+            `Propose exactement ${count} morceaux RÉELS disponibles en streaming sur ${target.service} — ` +
             `pas de titres inventés, pas de doublons, un seul morceau par artiste sauf si la demande impose le contraire. ` +
             `Respecte l'intention de la demande (ambiance, époque, langue, énergie) et l'ordre d'écoute ` +
             `(si une progression est demandée, ordonne les morceaux en conséquence). ` +
@@ -780,7 +787,7 @@ const commands: Record<string, { desc: string; usage?: string; run: (args: strin
 
       const sf = await getStorefront();
       console.log(dim(`Génération de la playlist (${limit} morceaux)…`));
-      const plan = await generateMixPlan(description, limit, sf);
+      const plan = await generateMixPlan(description, limit, { service: "Apple Music", storefront: sf });
 
       console.log(dim("Résolution contre le catalogue Apple Music…"));
       const resolved: Awaited<ReturnType<typeof resolveMixTrack>>[] = [];
@@ -986,12 +993,20 @@ const commands: Record<string, { desc: string; usage?: string; run: (args: strin
       const todo = needed.filter((t) => !(t.id in matches));
       console.log(dim(`${needed.length} morceaux, ${todo.length} à chercher sur Spotify (les autres sont déjà appariés)…`));
       const CHUNK = 4;
-      for (let i = 0; i < todo.length; i += CHUNK) {
-        const batch = todo.slice(i, i + CHUNK);
-        const found = await Promise.all(batch.map(spotifySearchTrack));
-        batch.forEach((t, j) => { matches[t.id] = found[j]?.uri ?? null; });
-        const done = Math.min(i + CHUNK, todo.length);
-        if (done % 100 < CHUNK || done === todo.length) { saveMatches(matches); process.stdout.write(`\r  ${done}/${todo.length}`); }
+      try {
+        for (let i = 0; i < todo.length; i += CHUNK) {
+          const batch = todo.slice(i, i + CHUNK);
+          const found = await Promise.all(batch.map(spotifySearchTrack));
+          batch.forEach((t, j) => { matches[t.id] = found[j]?.uri ?? null; });
+          const done = Math.min(i + CHUNK, todo.length);
+          if (done % 100 < CHUNK || done === todo.length) { saveMatches(matches); process.stdout.write(`\r  ${done}/${todo.length}`); }
+        }
+      } catch (e) {
+        if (!(e instanceof SpotifyQuotaExhausted)) throw e;
+        saveMatches(matches);
+        const matched = needed.filter((t) => t.id in matches).length;
+        console.log(`\n${red("■")} ${e.message} — ${matched}/${needed.length} morceaux appariés, relance la même commande pour continuer.`);
+        return;
       }
       if (todo.length) console.log();
 
@@ -1001,36 +1016,101 @@ const commands: Record<string, { desc: string; usage?: string; run: (args: strin
         (unmatched.length ? dim(` — ${unmatched.length} introuvables listés dans ${UNMATCHED_PATH}`) : ""));
       if (dryRun) { console.log(dim("--dry-run : rien n'a été écrit sur Spotify.")); return; }
 
-      if (doLiked) {
-        const uris = [...new Set(library.map((t) => matches[t.id]).filter(Boolean))] as string[];
-        for (let i = 0; i < uris.length; i += 40) {
-          await spotifyApi(`/v1/me/library?uris=${encodeURIComponent(uris.slice(i, i + 40).join(","))}`, { method: "PUT" });
-          process.stdout.write(`\r  Titres likés : ${Math.min(i + 40, uris.length)}/${uris.length}`);
+      try {
+        if (doLiked) {
+          const uris = [...new Set(library.map((t) => matches[t.id]).filter(Boolean))] as string[];
+          for (let i = 0; i < uris.length; i += 40) {
+            await spotifyApi(`/v1/me/library?uris=${encodeURIComponent(uris.slice(i, i + 40).join(","))}`, { method: "PUT" });
+            process.stdout.write(`\r  Titres likés : ${Math.min(i + 40, uris.length)}/${uris.length}`);
+          }
+          console.log(`\r${green("✓")} ${uris.length} titres likés sur Spotify (du plus ancien au plus récent)`);
         }
-        console.log(`\r${green("✓")} ${uris.length} titres likés sur Spotify (du plus ancien au plus récent)`);
+
+        if (doPlaylists) {
+          // nom → { id, total } ; une playlist créée mais remplie à moitié (quota) est complétée au prochain passage
+          const existing = new Map<string, { id: string; total: number }>();
+          for (let offset = 0; ; offset += 50) {
+            const page = await spotifyApi(`/v1/me/playlists?limit=50&offset=${offset}`);
+            for (const p of page.items ?? []) existing.set(p.name, { id: p.id, total: p.items?.total ?? p.tracks?.total ?? 0 });
+            if (!page.next) break;
+          }
+          for (const pl of playlists) {
+            const uris = [...new Set(pl.tracks.map((t) => matches[t.id]).filter(Boolean))] as string[];
+            if (uris.length === 0) { console.log(`  ${dim("–")} ${pl.name} ${dim("(vide ou introuvable, ignorée)")}`); continue; }
+            const found = existing.get(pl.name);
+            if (found && found.total >= uris.length) { console.log(`  ${dim("=")} ${pl.name} ${dim("(déjà sur Spotify, ignorée)")}`); continue; }
+            const id = found?.id ?? (await spotifyApi("/v1/me/playlists", {
+              method: "POST",
+              body: { name: pl.name, public: isPublic, description: "Importée d'Apple Music avec am" },
+            })).id;
+            for (let i = found?.total ?? 0; i < uris.length; i += 100) {
+              await spotifyApi(`/v1/playlists/${id}/items`, { method: "POST", body: { uris: uris.slice(i, i + 100) } });
+            }
+            console.log(`  ${green("✓")} ${pl.name} ${dim(`(${uris.length}/${pl.tracks.length})`)}`);
+          }
+        }
+      } catch (e) {
+        if (!(e instanceof SpotifyQuotaExhausted)) throw e;
+        console.log(`\n${red("■")} ${e.message} — relance la même commande pour terminer l'import.`);
+      }
+    },
+  },
+
+  "spotify-mix": {
+    desc: "Générer une playlist par IA et la créer sur Spotify",
+    usage: 'am spotify-mix "<description>" [--limit N] [--name <nom>] [--public] [--dry-run]',
+    run: async (args) => {
+      const dryRun = args.includes("--dry-run");
+      const isPublic = args.includes("--public");
+      args = args.filter((a) => a !== "--dry-run" && a !== "--public");
+      let name: string | undefined;
+      const ni = args.indexOf("--name");
+      if (ni !== -1) {
+        name = args[ni + 1];
+        args = [...args.slice(0, ni), ...args.slice(ni + 2)];
+      }
+      const { query: description, limit } = parseQuery(args);
+      if (!description) die('Usage : am spotify-mix "<description>" [--limit N] [--name <nom>] [--public] [--dry-run]');
+      if (!loadConfig().spotify?.refreshToken) {
+        die("Compte Spotify non connecté — lance `am spotify-login` pour la marche à suivre.");
       }
 
-      if (doPlaylists) {
-        const existing = new Set<string>();
-        for (let offset = 0; ; offset += 50) {
-          const page = await spotifyApi(`/v1/me/playlists?limit=50&offset=${offset}`);
-          for (const p of page.items ?? []) existing.add(p.name);
-          if (!page.next) break;
-        }
-        for (const pl of playlists) {
-          const uris = [...new Set(pl.tracks.map((t) => matches[t.id]).filter(Boolean))] as string[];
-          if (uris.length === 0) { console.log(`  ${dim("–")} ${pl.name} ${dim("(vide ou introuvable, ignorée)")}`); continue; }
-          if (existing.has(pl.name)) { console.log(`  ${dim("=")} ${pl.name} ${dim("(déjà sur Spotify, ignorée)")}`); continue; }
-          const created = await spotifyApi("/v1/me/playlists", {
-            method: "POST",
-            body: { name: pl.name, public: isPublic, description: "Importée d'Apple Music avec am" },
-          });
-          for (let i = 0; i < uris.length; i += 100) {
-            await spotifyApi(`/v1/playlists/${created.id}/items`, { method: "POST", body: { uris: uris.slice(i, i + 100) } });
-          }
-          console.log(`  ${green("✓")} ${pl.name} ${dim(`(${uris.length}/${pl.tracks.length})`)}`);
-        }
+      console.log(dim(`Génération de la playlist (${limit} morceaux)…`));
+      const plan = await generateMixPlan(description, limit, { service: "Spotify" });
+
+      console.log(dim("Recherche sur Spotify…"));
+      const results: (SpotifyMatch | null)[] = [];
+      const CHUNK = 4;
+      for (let i = 0; i < plan.tracks.length; i += CHUNK) {
+        const batch = plan.tracks.slice(i, i + CHUNK).map((t) => spotifySearchTrack({ name: t.title, artist: t.artist }));
+        results.push(...(await Promise.all(batch)));
       }
+
+      const playlistName = name ?? plan.name;
+      console.log(`\n${bold(playlistName)} — ${dim(plan.description)}`);
+      plan.tracks.forEach((t, i) => {
+        const r = results[i];
+        if (r) console.log(`  ${green("✓")} ${bold(r.name)} — ${r.artist}${r.exact ? "" : dim("  (correspondance approximative)")}`);
+        else console.log(`  ${red("✗")} ${t.title} — ${t.artist} ${dim("(introuvable sur Spotify)")}`);
+      });
+
+      const found = results.filter(Boolean) as SpotifyMatch[];
+      if (found.length === 0) die("Aucun morceau trouvé sur Spotify — playlist non créée.");
+      if (dryRun) {
+        console.log(dim(`\n--dry-run : rien n'a été créé (${found.length}/${plan.tracks.length} morceaux trouvés).`));
+        return;
+      }
+
+      const playlist = await spotifyApi("/v1/me/playlists", {
+        method: "POST",
+        body: { name: playlistName, public: isPublic, description: plan.description },
+      });
+      const uris = [...new Set(found.map((r) => r.uri))];
+      for (let i = 0; i < uris.length; i += 100) {
+        await spotifyApi(`/v1/playlists/${playlist.id}/items`, { method: "POST", body: { uris: uris.slice(i, i + 100) } });
+      }
+      console.log(`\n${green("✓")} Playlist ${bold(playlistName)} créée sur Spotify (${uris.length}/${plan.tracks.length} morceaux)`);
+      console.log(bold(playlist.external_urls.spotify));
     },
   },
 

@@ -77,6 +77,7 @@ auto-installé par Bun au premier lancement — le CLI reste un seul fichier.
 | `am spotify-login [client-id]` | Connecter ton compte Spotify / afficher l'état |
 | `am spotify <playlist> [--name <nom>] [--private] [--dry-run]` | Exporter une playlist Apple Music vers Spotify |
 | `am spotify-library [--liked-only\|--playlists-only] [--public] [--dry-run]` | Migrer toute la bibliothèque : titres likés + playlists |
+| `am spotify-mix "<description>" [--limit N] [--name <nom>] [--public] [--dry-run]` | `am mix`, mais la playlist est créée sur Spotify (même clé Anthropic) |
 
 Configuration unique (compte Spotify Premium requis depuis février 2026) :
 
@@ -94,7 +95,9 @@ am spotify-library             # like chaque morceau de la bibliothèque, recré
 
 L'export cherche chaque morceau par titre + artiste (puis titre simplifié + artiste principal), l'album départage les doublons. Quelques pistes peuvent manquer si elles ne sont pas disponibles sur Spotify : `✗` dans la sortie de `am spotify`, fichier `~/.config/am/spotify-unmatched.txt` pour `am spotify-library`.
 
-`am spotify-library` est relançable : les appariements sont mémorisés dans `~/.config/am/spotify-matches.json`, liker un titre déjà liké est sans effet et une playlist portant déjà le même nom sur Spotify est ignorée. Les titres sont likés du plus ancien au plus récent pour retrouver l'ordre d'Apple Music.
+`am spotify-library` est relançable : les appariements sont mémorisés dans `~/.config/am/spotify-matches.json`, liker un titre déjà liké est sans effet et une playlist portant déjà le même nom sur Spotify est ignorée (ou complétée si elle est restée à moitié remplie). Les titres sont likés du plus ancien au plus récent pour retrouver l'ordre d'Apple Music.
+
+Les apps Spotify en Development Mode ont un quota journalier de recherches (de l'ordre de 600 morceaux par 24 h, puis `429` avec un `Retry-After` d'une journée). Quand il tombe, la commande enregistre où elle en est et s'arrête : relance-la le lendemain, ou planifie-la chaque soir jusqu'à ce qu'elle annonce la fin.
 
 ### Playlists
 
