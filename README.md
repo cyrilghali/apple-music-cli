@@ -65,9 +65,8 @@ am mix "du funk égyptien des années 70 pour cuisiner" --limit 15
 am mix "montée progressive pour courir 45 minutes" --dry-run
 ```
 
-Nécessite le Media User Token (`am login`) et une clé API Anthropic
-(`export ANTHROPIC_API_KEY='sk-ant-...'`). Le SDK `@anthropic-ai/sdk` est
-auto-installé par Bun au premier lancement — le CLI reste un seul fichier.
+Nécessite le Media User Token (`am login`) et le CLI Claude Code connecté à
+ton abonnement (`claude login`) : la génération passe par `claude -p`, sans clé API.
 `--dry-run` génère et résout sans rien créer.
 
 ### Export Spotify
@@ -77,7 +76,7 @@ auto-installé par Bun au premier lancement — le CLI reste un seul fichier.
 | `am spotify-login [client-id]` | Connecter ton compte Spotify / afficher l'état |
 | `am spotify <playlist> [--name <nom>] [--private] [--dry-run]` | Exporter une playlist Apple Music vers Spotify |
 | `am spotify-library [--liked-only\|--playlists-only] [--public] [--dry-run]` | Migrer toute la bibliothèque : titres likés + playlists |
-| `am spotify-mix "<description>" [--limit N] [--name <nom>] [--public] [--dry-run]` | `am mix`, mais la playlist est créée sur Spotify (même clé Anthropic) |
+| `am spotify-mix "<description>" [--limit N] [--name <nom>] [--public] [--dry-run]` | `am mix`, mais la playlist est créée sur Spotify |
 
 Configuration unique (compte Spotify Premium requis depuis février 2026) :
 
